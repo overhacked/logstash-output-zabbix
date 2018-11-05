@@ -79,6 +79,35 @@ class LogStash::Outputs::Zabbix < LogStash::Outputs::Base
   # `zabbix_key` and `zabbix_value`.
   config :multi_value, :validate => :array
 
+  # Include only fields only if their names match specified regexps, default to empty list which means include everything.
+  # [source,ruby]
+  #     filter {
+  #       %PLUGIN% {
+  #         whitelist_fields => [ "method", "(referrer|status)", "${some}_field" ]
+  #       }
+  #     }
+  config :whitelist_fields, :validate => :array, :default => []
+
+  # Exclude fields whose names match specified regexps, by default exclude unresolved `%{field}` strings.
+  # [source,ruby]
+  #     filter {
+  #       %PLUGIN% {
+  #         blacklist_fields => [ "method", "(referrer|status)", "${some}_field" ]
+  #       }
+  #     }
+  config :blacklist_fields, :validate => :array, :default => [ "%\{[^}]+\}" ]
+
+  # Prefix string to put in front of field names that are derived from the
+  # whitelist/blacklist settings, before they are sent to Zabbix (e.g. "metric.").
+  # Default is the empty string.
+  # [source,ruby]
+  #     filter {
+  #       %PLUGIN% {
+  #         field_prefix => "metric."
+  #       }
+  #     }
+  config :field_prefix, :validate => :string, :default => ""
+
   # The number of seconds to wait before giving up on a connection to the Zabbix
   # server. This number should be very small, otherwise delays in delivery of
   # other outputs could result.
@@ -86,17 +115,20 @@ class LogStash::Outputs::Zabbix < LogStash::Outputs::Base
 
   public
   def register
+    @whitelist_fields_regexp = Regexp.union(@whitelist_fields.map {|x| Regexp.new(x)})
+    @blacklist_fields_regexp = Regexp.union(@blacklist_fields.map {|x| Regexp.new(x)})
+
     if !@zabbix_key.nil? && !@multi_value.nil?
       @logger.warn("Cannot use multi_value in conjunction with zabbix_key/zabbix_value.  Ignoring zabbix_key.")
     end
 
     # We're only going to use @multi_value in the end, so let's build it from
     # @zabbix_key and @zabbix_value if it is empty (single value configuration).
-    if @multi_value.nil?
+    if @multi_value.nil? && !@zabbix_key.nil?
       @multi_value = [ @zabbix_key, @zabbix_value ]
     end
-    if @multi_value.length % 2 == 1
-      raise LogStash::ConfigurationError, I18n.t("logstash.agent.configuration.invalid_plugin_register",
+    if !@multi_value.nil? && @multi_value.length % 2 == 1
+      raise LogStash::ConfigurationError, I18n.t("logstash.runner.configuration.invalid_plugin_register",
         :plugin => "output", :type => "zabbix",
         :error => "Invalid zabbix configuration #{@multi_value}. multi_value requires an even number of elements as ['zabbix_key1', 'zabbix_value1', 'zabbix_key2', 'zabbix_value2']")
     end
@@ -122,7 +154,7 @@ class LogStash::Outputs::Zabbix < LogStash::Outputs::Base
   end # kv_check
 
   public
-  def validate_fields(event)
+  def validate_multi_value_fields(event)
     found = []
     (0..@multi_value.length-1).step(2) do |idx|
       if kv_check(event, @multi_value[idx], @multi_value[idx+1])
@@ -131,23 +163,57 @@ class LogStash::Outputs::Zabbix < LogStash::Outputs::Base
       end
     end
     found
-  end # validate_fields
+  end # validate_multi_value_fields
 
   public
   def format_request(event)
     # The nested `clock` value is the event timestamp
     # The ending `clock` value is "now" so Zabbix knows it's not receiving stale
     # data.
-    validated = validate_fields(event)
+    host_clock_data = {
+      "host"  => event.get(@zabbix_host),
+      "clock" => event.get("@timestamp").to_i
+    }
     data = []
-    (0..validated.length-1).step(2) do |idx|
-      data << {
-        "host"  => event.get(@zabbix_host),
-        "key"   => event.get(validated[idx]),
-        "value" => event.get(validated[idx+1]),
-        "clock" => event.get("@timestamp").to_i
-      }
+    if !@multi_value.nil?
+      # Do things the older way with @multi_value or @zabbix_key/value
+      validated = validate_multi_value_fields(event)
+      (0..validated.length-1).step(2) do |idx|
+        data << {
+          "key"   => event.get(validated[idx]),
+          "value" => event.get(validated[idx+1])
+        }.merge!(host_clock_data)
+      end
+    else
+      # Do things the newer way with @white/blacklist_fields
+      hash = event.to_hash
+      fields_to_remove = []
+
+      unless @whitelist_fields.empty?
+        hash.each_key do |field|
+          fields_to_remove << field unless field.match(@whitelist_fields_regexp)
+        end
+      end
+
+      unless @blacklist_fields.empty?
+        hash.each_key do |field|
+          fields_to_remove << field if field.match(@blacklist_fields_regexp)
+        end
+      end
+
+      fields_to_remove.each do |field|
+        hash.delete(field)
+      end
+
+      hash.each do |key, value|
+        data << {
+          "key"   => "#{@field_prefix}#{key}",
+          "value" => value
+        }.merge!(host_clock_data)
+      end
+
     end
+
     {
       "request" => "sender data",
       "data" => data,
